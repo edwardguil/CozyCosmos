@@ -2,7 +2,7 @@
 ## Overview
 CozyCosmos is a scaled replica of humanities current solar system (as of 2023). Explore the particles flying around the asteriod belt, the amazing rotation speed of Jupiter and the sheer magnitude of space. CozyCosmos has realistic lighting, correct scaling, time controls and two ways of wandering the solar system. 
 
-<img src="https://s11.gifyu.com/images/SuRMu.gif">
+<img src="https://s11.gifyu.com/images/SuRxY.gif">
 
 ## Requirements
 For the best experience CozyCosmos requires a dedicated graphics card with atleast 2GB vram. In saying this, CozyCosmos can run on most newer computers with only a CPU, but you may experience some jittering and lag. 
