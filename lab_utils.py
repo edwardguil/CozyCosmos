@@ -4,39 +4,14 @@ from ctypes import sizeof, c_float, c_void_p, c_uint, string_at
 import xml.etree.ElementTree as ET
 import math
 import imgui
-from PIL import Image
-from collections import deque
+import freetype
+from noise import snoise3
+from OpenGL.GL import *
+import glfw, sys, imgui, warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+from imgui.integrations.glfw import GlfwRenderer as ImGuiGlfwRenderer
 
-def bindAndSetTexture(texUnit, textureId, textureName, shaderProgram,  textureType = GL_TEXTURE_2D):
-    glUseProgram(shaderProgram)
-    bindTexture(texUnit, textureId, textureType)
-    loc = glGetUniformLocation(shaderProgram, textureName)
-    glUniform1i(loc, texUnit)
-    glUseProgram(0)
 
-def bindTexture(texUnit, textureId, textureType = GL_TEXTURE_2D):
-	glActiveTexture(GL_TEXTURE0 + texUnit);
-	glBindTexture(textureType, textureId);
-
-def loadtexture(fileName): 
-    with Image.open(fileName) as image:
-        texId = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, texId)
-
-        data = image.tobytes("raw", "RGBX" if image.mode == 'RGB' else "RGBA", 0, -1)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, image.size[0], image.size[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-
-        glGenerateMipmap(GL_TEXTURE_2D)
-
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-
-        glBindTexture(GL_TEXTURE_2D, 0);
-        return texId
-
-# This is a helper class to provide the ability to use * for matrix/matrix and matrix/vector multiplication.
-# It also helps out uploading constants and a few other operations as python does not support overloading functions.
-# Note that a vector is just represented as a list on floats, and we rely on numpy to take care of the 
 class Mat4:
     matData = None
     # Construct a Mat4 from a python array
@@ -231,6 +206,19 @@ def vec3(x, y = None, z = None):
     if z == None:
         return np.array([x,y,y], dtype=np.float32)
     return np.array([x, y, z], dtype=np.float32)
+
+def vec4(x, y = None, z = None, w = None):
+    if y == None:
+        return np.array([x,x,x,x], dtype=np.float32)
+    if z == None:
+        return np.array([x,y,y,y], dtype=np.float32)
+    if w == None:
+        return np.array([x,y,z,z], dtype=np.float32)
+    return np.array([x, y, z, w], dtype=np.float32)
+
+def dot(a, b):
+    return np.dot(a, b)
+
 
 # The reason we need a 'look from', and don't just use lookAt(pos, pos+dir, up) is because if pos is large (i.e., far from the origin) and 'dir' is a unit vector (common case)
 # then the precision loss in the addition followed by subtraction in lookAt to get the direction back is _significant_, and leads to jerky camera movements.
@@ -561,574 +549,384 @@ def make_perspective(fovy, aspect, n, f):
                  [0,0,-1,0]])
 
 
-class FreeCamera:
-    position = vec3(0.0,0.0,0.0)
-    yawDeg = 0.0
-    pitchDeg = 0.0
-    maxSpeed = 50
-    angSpeed = 10
 
-    def __init__(self, pos, yawDeg, pitchDeg):
-        self.position = vec3(*pos)
-        self.yawDeg = yawDeg
-        self.pitchDeg = pitchDeg
-        self.mouseDeltaBuffer = deque(maxlen=5)
+g_mousePos = [0.0, 0.0]
 
-    def update(self, dt, keys, mouseDelta):
-        cameraSpeed = 0.0
-        cameraTurnSpeed = 0.0
-        cameraPitchSpeed = 0.0
-        cameraStrafeSpeed = 0.0
+VAL_Position = 0
+g_vertexDataBuffer = 0
+g_vertexArrayObject = 0
+g_simpleShader = 0
 
-        if keys["UP"] or keys["W"]:
-            cameraSpeed -= self.maxSpeed
-        if keys["DOWN"] or keys["S"]:
-            cameraSpeed += self.maxSpeed
-        if keys["LEFT"]:
-            cameraTurnSpeed += self.angSpeed
-        if keys["RIGHT"]:
-            cameraTurnSpeed -= self.angSpeed
-        if keys["A"]:
-            cameraStrafeSpeed -= self.maxSpeed
-        if keys["D"]:
-            cameraStrafeSpeed += self.maxSpeed
 
-        # Mouse look is enabled with right mouse button
-        if keys["MOUSE_BUTTON_LEFT"]:
-            self.mouseDeltaBuffer.append(mouseDelta)
-            mouseDeltaAvg = np.mean(self.mouseDeltaBuffer, axis=0)
-            cameraTurnSpeed = mouseDeltaAvg[0] * self.angSpeed
-            cameraPitchSpeed = mouseDeltaAvg[1] * self.angSpeed
+def beginImGuiHud():
+    global g_mousePos
+    imgui.set_next_window_position(5.0, 5.0)
 
-        self.yawDeg += cameraTurnSpeed * dt
-        self.pitchDeg = min(89.0, max(-89.0, self.pitchDeg - cameraPitchSpeed * dt))
+    if imgui.begin("Example: Fixed Overlay", 0, imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_ALWAYS_AUTO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SAVED_SETTINGS | imgui.WINDOW_NO_FOCUS_ON_APPEARING):
+        pass
 
-        cameraRotation = Mat3(make_rotation_y(math.radians(self.yawDeg))) * Mat3(make_rotation_x(math.radians(self.pitchDeg))) 
-        cameraDirection = cameraRotation * [0,0,1]
-        self.position += np.array(cameraDirection) * cameraSpeed * dt
 
-        #strafe measns perpendicular left-right movement, so rotate the X unit vector and go
+def endImGuiHud():
+        imgui.end()
+
+
+def runProgram(title, startWidth, startHeight, renderFrame, initResources = None, drawUi = None, update = None):
+    global g_simpleShader
+    global g_vertexArrayObject
+    global g_vertexDataBuffer
+    global g_mousePos
+
+    if not glfw.init():
+        sys.exit(1)
+
+    #glfw.window_hint(glfw.OPENGL_DEBUG_CONTEXT, 1)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
+    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, GL_TRUE)
+
+
+    window = glfw.create_window(startWidth, startHeight, title, None, None)
+    if not window:
+        glfw.terminate()
+        sys.exit(1)
+
+    glfw.make_context_current(window) 
+
+    print("--------------------------------------\nOpenGL\n  Vendor: %s\n  Renderer: %s\n  Version: %s\n--------------------------------------\n" % (glGetString(GL_VENDOR).decode("utf8"), glGetString(GL_RENDERER).decode("utf8"), glGetString(GL_VERSION).decode("utf8")), flush=True)
+    imgui.create_context()
+    impl = ImGuiGlfwRenderer(window)
+
     
-        self.position += np.array(cameraRotation * [1,0,0]) * cameraStrafeSpeed * dt
+    glDisable(GL_CULL_FACE)
+    glEnable(GL_DEPTH_TEST)
+    glDepthFunc(GL_LEQUAL)
 
-    def drawUi(self):
-        if imgui.tree_node("FreeCamera", imgui.TREE_NODE_DEFAULT_OPEN):
-            _,self.yawDeg = imgui.slider_float("Yaw (Deg)", self.yawDeg, -180.00, 180.0)
-            _,self.pitchDeg = imgui.slider_float("Pitch (Deg)", self.pitchDeg, -89.00, 89.0)
-            imgui.tree_pop()
+    if initResources:
+        initResources()
+        
+    currentTime = glfw.get_time()
+    prevMouseX,prevMouseY = glfw.get_cursor_pos(window)
+
+    while not glfw.window_should_close(window):
+        prevTime = currentTime
+        currentTime = glfw.get_time()
+        dt = currentTime - prevTime
+
+        keyStateMap = {}
+        for name,id in g_glfwKeymap.items():
+            keyStateMap[name] = glfw.get_key(window, id) == glfw.PRESS
+
+        for name,id in g_glfwMouseMap.items():
+            keyStateMap[name] = glfw.get_mouse_button(window, id) == glfw.PRESS
+
+        mouseX,mouseY = glfw.get_cursor_pos(window)
+        g_mousePos = [mouseX,mouseY]
+
+        imIo = imgui.get_io()
+        mouseDelta = [mouseX - prevMouseX, mouseY - prevMouseY]
+        if imIo.want_capture_mouse:
+            mouseDelta = [0,0]
+        update(dt, keyStateMap, mouseDelta)
+        prevMouseX,prevMouseY = mouseX,mouseY
+        
+        # Render here, e.g.  using pyOpenGL
+        width, height = glfw.get_framebuffer_size(window)
+
+        imgui.new_frame()
+
+        beginImGuiHud()
+
+        renderFrame(width, height)
     
-    def getWorldToViewMatrix(self, up):
-        cameraDirection = Mat3(make_rotation_y(math.radians(self.yawDeg))) * Mat3(make_rotation_x(math.radians(self.pitchDeg))) * [0,0,1]
-        return make_lookFrom(self.position, cameraDirection, [0,1,0])
+        if drawUi:
+            drawUi()
+
+        endImGuiHud()
+        imgui.render()
+        impl.render(imgui.get_draw_data())
+        # Swap front and back buffers
+        glfw.swap_buffers(window)
+
+        # Poll for and process events
+        glfw.poll_events()
+        impl.process_inputs()
+
+    glfw.terminate()
+
+
+
+g_glfwMouseMap = {
+    "MOUSE_BUTTON_LEFT" : glfw.MOUSE_BUTTON_LEFT,
+    "MOUSE_BUTTON_RIGHT" : glfw.MOUSE_BUTTON_RIGHT,
+    "MOUSE_BUTTON_MIDDLE" : glfw.MOUSE_BUTTON_MIDDLE,
+}
+
+
+g_glfwKeymap = {
+    "SPACE" : glfw.KEY_SPACE,
+    "APOSTROPHE" : glfw.KEY_APOSTROPHE,
+    "COMMA" : glfw.KEY_COMMA,
+    "MINUS" : glfw.KEY_MINUS,
+    "PERIOD" : glfw.KEY_PERIOD,
+    "SLASH" : glfw.KEY_SLASH,
+    "0" : glfw.KEY_0,
+    "1" : glfw.KEY_1,
+    "2" : glfw.KEY_2,
+    "3" : glfw.KEY_3,
+    "4" : glfw.KEY_4,
+    "5" : glfw.KEY_5,
+    "6" : glfw.KEY_6,
+    "7" : glfw.KEY_7,
+    "8" : glfw.KEY_8,
+    "9" : glfw.KEY_9,
+    "SEMICOLON" : glfw.KEY_SEMICOLON,
+    "EQUAL" : glfw.KEY_EQUAL,
+    "A" : glfw.KEY_A,
+    "B" : glfw.KEY_B,
+    "C" : glfw.KEY_C,
+    "D" : glfw.KEY_D,
+    "E" : glfw.KEY_E,
+    "F" : glfw.KEY_F,
+    "G" : glfw.KEY_G,
+    "H" : glfw.KEY_H,
+    "I" : glfw.KEY_I,
+    "J" : glfw.KEY_J,
+    "K" : glfw.KEY_K,
+    "L" : glfw.KEY_L,
+    "M" : glfw.KEY_M,
+    "N" : glfw.KEY_N,
+    "O" : glfw.KEY_O,
+    "P" : glfw.KEY_P,
+    "Q" : glfw.KEY_Q,
+    "R" : glfw.KEY_R,
+    "S" : glfw.KEY_S,
+    "T" : glfw.KEY_T,
+    "U" : glfw.KEY_U,
+    "V" : glfw.KEY_V,
+    "W" : glfw.KEY_W,
+    "X" : glfw.KEY_X,
+    "Y" : glfw.KEY_Y,
+    "Z" : glfw.KEY_Z,
+    "LEFT_BRACKET" : glfw.KEY_LEFT_BRACKET,
+    "BACKSLASH" : glfw.KEY_BACKSLASH,
+    "RIGHT_BRACKET" : glfw.KEY_RIGHT_BRACKET,
+    "GRAVE_ACCENT" : glfw.KEY_GRAVE_ACCENT,
+    "WORLD_1" : glfw.KEY_WORLD_1,
+    "WORLD_2" : glfw.KEY_WORLD_2,
+    "ESCAPE" : glfw.KEY_ESCAPE,
+    "ENTER" : glfw.KEY_ENTER,
+    "TAB" : glfw.KEY_TAB,
+    "BACKSPACE" : glfw.KEY_BACKSPACE,
+    "INSERT" : glfw.KEY_INSERT,
+    "DELETE" : glfw.KEY_DELETE,
+    "RIGHT" : glfw.KEY_RIGHT,
+    "LEFT" : glfw.KEY_LEFT,
+    "DOWN" : glfw.KEY_DOWN,
+    "UP" : glfw.KEY_UP,
+    "PAGE_UP" : glfw.KEY_PAGE_UP,
+    "PAGE_DOWN" : glfw.KEY_PAGE_DOWN,
+    "HOME" : glfw.KEY_HOME,
+    "END" : glfw.KEY_END,
+    "CAPS_LOCK" : glfw.KEY_CAPS_LOCK,
+    "SCROLL_LOCK" : glfw.KEY_SCROLL_LOCK,
+    "NUM_LOCK" : glfw.KEY_NUM_LOCK,
+    "PRINT_SCREEN" : glfw.KEY_PRINT_SCREEN,
+    "PAUSE" : glfw.KEY_PAUSE,
+    "F1" : glfw.KEY_F1,
+    "F2" : glfw.KEY_F2,
+    "F3" : glfw.KEY_F3,
+    "F4" : glfw.KEY_F4,
+    "F5" : glfw.KEY_F5,
+    "F6" : glfw.KEY_F6,
+    "F7" : glfw.KEY_F7,
+    "F8" : glfw.KEY_F8,
+    "F9" : glfw.KEY_F9,
+    "F10" : glfw.KEY_F10,
+    "F11" : glfw.KEY_F11,
+    "F12" : glfw.KEY_F12,
+    "F13" : glfw.KEY_F13,
+    "F14" : glfw.KEY_F14,
+    "F15" : glfw.KEY_F15,
+    "F16" : glfw.KEY_F16,
+    "F17" : glfw.KEY_F17,
+    "F18" : glfw.KEY_F18,
+    "F19" : glfw.KEY_F19,
+    "F20" : glfw.KEY_F20,
+    "F21" : glfw.KEY_F21,
+    "F22" : glfw.KEY_F22,
+    "F23" : glfw.KEY_F23,
+    "F24" : glfw.KEY_F24,
+    "F25" : glfw.KEY_F25,
+    "KP_0" : glfw.KEY_KP_0,
+    "KP_1" : glfw.KEY_KP_1,
+    "KP_2" : glfw.KEY_KP_2,
+    "KP_3" : glfw.KEY_KP_3,
+    "KP_4" : glfw.KEY_KP_4,
+    "KP_5" : glfw.KEY_KP_5,
+    "KP_6" : glfw.KEY_KP_6,
+    "KP_7" : glfw.KEY_KP_7,
+    "KP_8" : glfw.KEY_KP_8,
+    "KP_9" : glfw.KEY_KP_9,
+    "KP_DECIMAL" : glfw.KEY_KP_DECIMAL,
+    "KP_DIVIDE" : glfw.KEY_KP_DIVIDE,
+    "KP_MULTIPLY" : glfw.KEY_KP_MULTIPLY,
+    "KP_SUBTRACT" : glfw.KEY_KP_SUBTRACT,
+    "KP_ADD" : glfw.KEY_KP_ADD,
+    "KP_ENTER" : glfw.KEY_KP_ENTER,
+    "KP_EQUAL" : glfw.KEY_KP_EQUAL,
+    "LEFT_SHIFT" : glfw.KEY_LEFT_SHIFT,
+    "LEFT_CONTROL" : glfw.KEY_LEFT_CONTROL,
+    "LEFT_ALT" : glfw.KEY_LEFT_ALT,
+    "LEFT_SUPER" : glfw.KEY_LEFT_SUPER,
+    "RIGHT_SHIFT" : glfw.KEY_RIGHT_SHIFT,
+    "RIGHT_CONTROL" : glfw.KEY_RIGHT_CONTROL,
+    "RIGHT_ALT" : glfw.KEY_RIGHT_ALT,
+    "RIGHT_SUPER" : glfw.KEY_RIGHT_SUPER,
+    "MENU" : glfw.KEY_MENU,
+}
     
 
+class CharacterSlot:
+    def __init__(self, texture, glyph):
+        self.texture = texture
+        self.textureSize = (glyph.bitmap.width, glyph.bitmap.rows)
 
-class OrbitCamera:
-    target = vec3(0.0,0.0,0.0)
-    distance = 1.0
-    yawDeg = 0.0
-    pitchDeg = 0.0
-    maxSpeed = 10
-    angSpeed = 10
-    position = vec3(0.0,1.0,0.0)
+        if isinstance(glyph, freetype.GlyphSlot):
+            self.bearing = (glyph.bitmap_left, glyph.bitmap_top)
+            self.advance = glyph.advance.x
+        elif isinstance(glyph, freetype.BitmapGlyph):
+            self.bearing = (glyph.left, glyph.top)
+            self.advance = None
+        else:
+            raise RuntimeError('unknown glyph type')
 
-    def __init__(self, target, distance, yawDeg, pitchDeg):
-        self.target = vec3(*target)
-        self.yawDeg = yawDeg
-        self.pitchDeg = pitchDeg
-        self.distance = distance
-        self.mouseDeltaBuffer = deque(maxlen=5)
 
-    def update(self, dt, keys, mouseDelta):
-        cameraSpeed = 0.0
-        cameraTurnSpeed = 0.0
-        cameraPitchSpeed = 0.0
-        cameraStrafeSpeed = 0.0
-
-        # Mouse look is enabled with right mouse button
-        if keys["MOUSE_BUTTON_LEFT"]:
-            self.mouseDeltaBuffer.append(mouseDelta)
-            mouseDeltaAvg = np.mean(self.mouseDeltaBuffer, axis=0)
-            cameraTurnSpeed = mouseDeltaAvg[0] * self.angSpeed
-            cameraPitchSpeed = mouseDeltaAvg[1] * self.angSpeed
-
-        if keys["MOUSE_BUTTON_RIGHT"]:
-            self.distance = max(1.0, self.distance + mouseDelta[1])
-
-        self.yawDeg += cameraTurnSpeed * dt
-        self.pitchDeg = min(89.0, max(-89.0, self.pitchDeg + cameraPitchSpeed * dt))
-
-        cameraRotation = Mat3(make_rotation_y(math.radians(self.yawDeg))) * Mat3(make_rotation_x(math.radians(self.pitchDeg))) 
-        self.position = cameraRotation * vec3(0,0,self.distance)
-
-    def drawUi(self):
-        if imgui.tree_node("OrbitCamera", imgui.TREE_NODE_DEFAULT_OPEN):
-            _,self.yawDeg = imgui.slider_float("Yaw (Deg)", self.yawDeg, -180.00, 180.0)
-            _,self.pitchDeg = imgui.slider_float("Pitch (Deg)", self.pitchDeg, -89.00, 89.0)
-            _,self.distance = imgui.slider_float("Distance", self.distance, 1.00, 1000.0)
-            imgui.tree_pop()
-    
-    def getWorldToViewMatrix(self, up):
-        return make_lookAt(self.position, self.target, up)
-
-g_texture_count = -1
-class Sphere:
-    def __init__(self, texture, r=1.0, sectors=36, stacks=18):
-        global g_texture_count
-        self.radius = r
-        self.sectorCount = sectors
-        self.stackCount = stacks
-        self.sphere_vertices = []
-        self.sphere_indices = []
+class Text:
+    def __init__(self, fontfile):
+        self.fontfile = fontfile
+        self.characters = dict()
         self.VAO = glGenVertexArrays(1)
         self.VBO = glGenBuffers(1)
-        self.EBO = glGenBuffers(1)
-        self.shader = None
-        g_texture_count += 1
-        self.textUnit = g_texture_count
-        self.textId = 0
-        
-        self.generate_vertices()
-        self.generate_indices()
+
         self.generate_buffers()
         self.generate_shader()
-        self.construct_texture(texture)
-        
-    def generate_vertices(self):
-        for i in range(self.stackCount + 1):
-            stack_angle = math.pi / 2 - i * math.pi / self.stackCount
-            xy = self.radius * math.cos(stack_angle)
-            z = self.radius * math.sin(stack_angle)
-
-            for j in range(self.sectorCount + 1):
-                sector_angle = j * 2 * math.pi / self.sectorCount
-
-                x = xy * math.cos(sector_angle)
-                y = xy * math.sin(sector_angle)
-                nx, ny, nz = x / self.radius, y / self.radius, z / self.radius # Normals are same as position for a unit sphere
-                s = j / self.sectorCount
-                t = i / self.stackCount
-                self.sphere_vertices.extend([x, y, z, nx, ny, nz, s, t]) # Append normals and texture coordinates to vertices
-
-
-    def generate_indices(self):
-        for i in range(self.stackCount):
-            k1 = i * (self.sectorCount + 1)
-            k2 = k1 + self.sectorCount + 1
-
-            for j in range(self.sectorCount):
-                if i != 0:
-                    self.sphere_indices.extend([k1, k2, k1 + 1])
-
-                if i != (self.stackCount-1):
-                    self.sphere_indices.extend([k1 + 1, k2, k2 + 1])
-
-                k1 += 1
-                k2 += 1
 
     def generate_buffers(self):
         glBindVertexArray(self.VAO)
 
         glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
-        glBufferData(GL_ARRAY_BUFFER, 
-                     np.array(self.sphere_vertices, dtype=np.float32), 
-                     GL_DYNAMIC_DRAW)
-
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.EBO)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, 
-                     np.array(self.sphere_indices, dtype=np.uint32), 
-                     GL_DYNAMIC_DRAW)
-
-        # Set the position attribute
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * 4, None)
-        glEnableVertexAttribArray(0)
-
-        # Set the normal attribute
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * 4, ctypes.c_void_p(3 * 4))
-        glEnableVertexAttribArray(1)
+        glBufferData(GL_ARRAY_BUFFER, 6 * 4 * 4, None, GL_DYNAMIC_DRAW)
         
-        # Set the texture attribute
-        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * 4, ctypes.c_void_p(6 * 4))
-        glEnableVertexAttribArray(2)
-
+        glEnableVertexAttribArray(0)       
+        glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, None)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
 
-    def construct_texture(self, texture):
-        self.textId = loadtexture(texture)
-        bindAndSetTexture(self.textUnit, self.textId, "texture1", self.shader)
+        face = freetype.Face(self.fontfile)
+        face.set_char_size( 48*64 )
 
-    def draw(self, modelToClipTransform, modelToViewTransform, modelToViewNormalTransform, lightParameters):
+        #load first 128 characters of ASCII set
+        for i in range(0,128):
+            character = chr(i)
+            face.load_char(character)
+            glyph = face.glyph
+            
+            #generate texture
+            textId = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, textId)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, glyph.bitmap.width, glyph.bitmap.rows, 0,
+                        GL_RED, GL_UNSIGNED_BYTE, glyph.bitmap.buffer)
+
+            #texture options
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+            #now store character for later use
+            self.characters[chr(i)] = CharacterSlot(textId, glyph)
+
+        glBindTexture(GL_TEXTURE_2D, 0)
+        
+    def generate_vertices(self, xpos, ypos, w, h):
+        return np.asarray([
+            xpos,     ypos - h, 0, 0,
+            xpos,     ypos,     0, 1,
+            xpos + w, ypos,     1, 1,
+            xpos,     ypos - h, 0, 0,
+            xpos + w, ypos,     1, 1,
+            xpos + w, ypos - h, 1, 0
+        ], np.float32)
+
+    def render_text(self, text, modelToClipTransform, color, scale):
         glUseProgram(self.shader)
+        face = freetype.Face(self.fontfile)
+        face.set_char_size(48*64)
+
         setUniform(self.shader, "modelToClipTransform", modelToClipTransform)
-        setUniform(self.shader, "modelToViewTransform", modelToViewTransform)
-        setUniform(self.shader, "modelToViewNormalTransform", modelToViewNormalTransform)  
-        setUniform(self.shader, "lightPosition", lightParameters[0])
-        setUniform(self.shader, "lightColor", lightParameters[1])
-        setUniform(self.shader, "lightIntensity", lightParameters[2])
-        setUniform(self.shader, "ambientColor", lightParameters[3])
-        setUniform(self.shader, "ambientIntensity", lightParameters[4])
-                   
-        glActiveTexture(GL_TEXTURE0 + self.textUnit)
-        glBindTexture(GL_TEXTURE_2D, self.textId)
-        
-        glBindVertexArray(self.VAO)
-        glDrawElements(GL_TRIANGLES, len(self.sphere_indices), GL_UNSIGNED_INT, None)
-        glBindVertexArray(0)
-        glUseProgram(0)
-        
-    def generate_shader(self):
-        vertexShader = """
-            #version 330
-            in vec3 positionIn;
-            in vec3 normalIn;
-            in vec2	texCoord;
+        setUniform(self.shader, "textColor", color)
 
-            uniform mat4 modelToClipTransform;
-            uniform mat4 modelToViewTransform;
-            uniform mat3 modelToViewNormalTransform;
+        glActiveTexture(GL_TEXTURE0)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glBindVertexArray(self.VAO)
+
+        x, y = 1, 1
+        for c in text:            
+            ch = self.characters[c]
             
-            out VertexData
-            {
-                vec3 v2f_viewSpaceNormal;
-                vec3 v2f_viewSpacePosition;
-                vec2 v2f_texCoord;
-            };
+            w, h = ch.textureSize
+            # Adjust x and y based on the character bearing
+            w = w * scale
+            h = h * scale
+
+            vertices = self.generate_vertices(x, y, w, h)
 
 
-            void main() 
-            {
-                v2f_viewSpacePosition = (modelToViewTransform * vec4(positionIn, 1.0)).xyz;
-                v2f_viewSpaceNormal = normalize(modelToViewNormalTransform * normalIn);
-                v2f_texCoord = texCoord;
-	            gl_Position = modelToClipTransform * vec4(positionIn, 1.0);
-            }"""
-            
-        fragmentShader = """
-            #version 330
-            in VertexData
-            {
-                vec3 v2f_viewSpaceNormal;
-                vec3 v2f_viewSpacePosition;
-                vec2 v2f_texCoord;
-            };
+            #render glyph texture over quad
+            glBindTexture(GL_TEXTURE_2D, ch.texture)
+            #update content of VBO memory
+            glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.nbytes, vertices)
 
-            uniform sampler2D texture1;
-            uniform vec3 lightPosition;
-            uniform vec3 lightColor;
-            uniform float lightIntensity;
-            uniform vec3 ambientColor;
-            uniform float ambientIntensity;
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            #render quad
+            glDrawArrays(GL_TRIANGLES, 0, 6)
+            #now advance cursors for next glyph (note that advance is number of 1/64 pixels)
+            x += (ch.advance>>6)*scale
 
-            out vec4 fragmentColor;
-
-            void main() 
-            {
-                vec3 toLight = lightPosition - v2f_viewSpacePosition;
-                float distanceToLight = length(toLight);
-                vec3 lightDirection = toLight / distanceToLight;
-                float diffuseFactor = max(dot(v2f_viewSpaceNormal, lightDirection), 0.0);
-                vec3 diffuseColor = diffuseFactor * lightColor * lightIntensity / (distanceToLight * 0.05);
-                vec3 ambientColorTotal = ambientColor * ambientIntensity;
-                vec4 textureColor = texture(texture1, v2f_texCoord);
-                fragmentColor = vec4((diffuseColor + ambientColorTotal), 1.0) * textureColor;
-            }
-        """
-        self.shader = buildShader([vertexShader], [fragmentShader], {"positionIn" : 0, "normalIn" : 1, "texCoord" : 2})
-
-class OrbitRing:
-    def __init__(self, r=1.0, sectors=100):
-        self.radius = r
-        self.sectorCount = sectors
-        self.orbit_vertices = []
-        self.orbit_indices = []
-        self.VAO = glGenVertexArrays(1)
-        self.VBO = glGenBuffers(1)
-        self.EBO = glGenBuffers(1)
-        self.shader = None
-
-        self.generate_vertices()
-        self.generate_indices()
-        self.generate_buffers()
-        self.generate_shader()
-
-    def generate_vertices(self):
-        for i in range(self.sectorCount + 1):
-            sector_angle = i * 2 * math.pi / self.sectorCount
-
-            x = self.radius * math.cos(sector_angle)
-            y = 0
-            z = self.radius * math.sin(sector_angle)
-            self.orbit_vertices.extend([x, y, z])
-
-    def generate_indices(self):
-        for i in range(self.sectorCount):
-            if i != self.sectorCount - 1:
-                self.orbit_indices.extend([i, i + 1])
-            else:
-                self.orbit_indices.extend([i, 0])
-
-    def generate_buffers(self):
-        glBindVertexArray(self.VAO)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
-        glBufferData(GL_ARRAY_BUFFER, 
-                     np.array(self.orbit_vertices, dtype=np.float32), 
-                     GL_STATIC_DRAW)
-
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.EBO)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, 
-                     np.array(self.orbit_indices, dtype=np.uint32), 
-                     GL_STATIC_DRAW)
-
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * 4, None)
-        glEnableVertexAttribArray(0)
-
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
         glBindVertexArray(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
 
-    def draw(self, modelToClipTransform, color=[1.0, 1.0, 1.0]):
-        glUseProgram(self.shader)
-        setUniform(self.shader, "modelToClipTransform", modelToClipTransform)
-        setUniform(self.shader, "color", color)
-        
-        glBindVertexArray(self.VAO)
-        glDrawElements(GL_LINES, len(self.orbit_indices), GL_UNSIGNED_INT, None)
-        glBindVertexArray(0)
-        glUseProgram(0)
-        
-    def generate_shader(self):
-        vertexShader = """
-            #version 330
-            in vec3 positionIn;
-
-            uniform mat4 modelToClipTransform;
-
-            void main() 
-            {
-                gl_Position = modelToClipTransform * vec4(positionIn, 1.0);
-            }"""
-            
-        fragmentShader = """
-            #version 330
-
-            uniform vec3 color;
-
-            out vec4 fragmentColor;
-
-            void main() 
-            {
-                fragmentColor = vec4(color, 1.0);
-            }
-        """
-        self.shader = buildShader([vertexShader], [fragmentShader], {"positionIn" : 0})
-
-class TextFont:
-    def __init__(self):
-        self.shader = None
-        self.load_font('data/fonts/sans-serif.png', 'data/fonts/sans-serif.xml')
-
-    def load_font(self, image_path, xml_path):
-        # Load font atlas texture
-        image = Image.open(image_path).convert('RGBA')
-        width, height = image.size
-        self.texture = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_2D, self.texture)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, np.array(image))
-        
-        # Load glyph metrics from XML
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-        self.glyphs = {g.attrib['char']: g.attrib for g in root.iter('glyph')}
-        
-    def draw(self, text, toClipTransform, color):
-        # Compile shader program if not done yet
-        if self.shader is None:
-            self.shader = self.compile_shader()
-        
-        # Activate shader program
-        glUseProgram(self.shader)
-        
-        # Set uniform variables
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "toClipTransform"), 1, GL_TRUE, toClipTransform)
-        glUniform4f(glGetUniformLocation(self.shader, "color"), *color)
-        
-        # Render glyphs
-        glBindTexture(GL_TEXTURE_2D, self.texture)
-        for c in text:
-            g = self.glyphs.get(c)
-            if g is not None:
-                x, y, w, h = map(int, (g['x'], g['y'], g['width'], g['height']))
-                
-                glBegin(GL_QUADS)
-                glTexCoord2f(x, y); glVertex2f(x, y)
-                glTexCoord2f(x+w, y); glVertex2f(x+w, y)
-                glTexCoord2f(x+w, y+h); glVertex2f(x+w, y+h)
-                glTexCoord2f(x, y+h); glVertex2f(x, y+h)
-                glEnd()
-        
-    def compile_shader(self):
-        # Shader program that renders a textured quad with uniform color
-        vertex_shader_source = """
-        #version 330 core
-        in vec2 aPos;
-        in vec2 aTexCoord;
-        out vec2 TexCoord;
-        uniform mat4 toClipTransform;
-        void main() {
-            gl_Position = toClipTransform * vec4(aPos, 0.0, 1.0);
-            TexCoord = aTexCoord;
-        }"""
-        
-        fragment_shader_source = """
-        #version 330 core
-        out vec4 FragColor;
-        in vec2 TexCoord;
-        uniform sampler2D text;
-        uniform vec4 color;
-        void main() {
-            FragColor = texture(text, TexCoord) * color;
-        }"""
-        
-        # Compile vertex shader
-        self.shader = buildShader([vertex_shader_source], [fragment_shader_source], {"aPos" : 0, "aTexCoord" : 1})
-        
-       
-
-       
-
-
-
-class SkyBox: 
-    
-    def __init__(self, textures=['right.png', 'left.png', 'top.png', 'bottom.png', 'back.png', 'front.png']):
-        self.texId = None
-        self.vertices = None
-        self.shader = None
-        self.VAO = glGenVertexArrays(1)
-        self.VBO = glGenBuffers(1)
-        
-        self.load_skybox(textures)
-        self.generate_vertices()
-        self.build_skybox()
-        self.generate_shader()
-    
-    def load_skybox(self, textures):
-        self.texId = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_CUBE_MAP, self.texId)
-
-        for i in range(6):
-            image = Image.open("data/skybox/" + textures[i])
-            img_data = image.tobytes("raw", "RGBX" if image.mode == 'RGB' else "RGBA", 0, -1)
-            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_RGBA, image.size[0], image.size[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data);
-        
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)
-
-    def build_skybox(self):       
-        glBindVertexArray(self.VAO)
-        glBindBuffer(GL_ARRAY_BUFFER, self.VBO)
-        glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STATIC_DRAW)
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
-        glBindVertexArray(0)
-            
-    def draw(self, viewToClipTransform, worldToViewTransform):
-        glUseProgram(self.shader)
-        glUniform1i(glGetUniformLocation(self.shader, "skybox"), 0)
-        setUniform(self.shader, "viewToClipTransform", viewToClipTransform)
-        setUniform(self.shader, "worldToViewTransform", worldToViewTransform)
-        
-        
-        glDepthMask(GL_FALSE)
-        glBindTexture(GL_TEXTURE_CUBE_MAP, self.texId)
-        glBindVertexArray(self.VAO)
-        glDrawArrays(GL_TRIANGLES, 0, 36)
-        
-        
-        glBindVertexArray(0)
-        glDepthMask(GL_TRUE) 
-        glUseProgram(0)
-        
-    def generate_vertices(self):
-        self.vertices = np.array([
-                        -1.0,  1.0, -1.0,
-                        -1.0, -1.0, -1.0,
-                        1.0, -1.0, -1.0,
-                        1.0, -1.0, -1.0,
-                        1.0,  1.0, -1.0,
-                        -1.0,  1.0, -1.0,
-
-                        -1.0, -1.0,  1.0,
-                        -1.0, -1.0, -1.0,
-                        -1.0,  1.0, -1.0,
-                        -1.0,  1.0, -1.0,
-                        -1.0,  1.0,  1.0,
-                        -1.0, -1.0,  1.0,
-
-                        1.0, -1.0, -1.0,
-                        1.0, -1.0,  1.0,
-                        1.0,  1.0,  1.0,
-                        1.0,  1.0,  1.0,
-                        1.0,  1.0, -1.0,
-                        1.0, -1.0, -1.0,
-
-                        -1.0, -1.0,  1.0,
-                        -1.0,  1.0,  1.0,
-                        1.0,  1.0,  1.0,
-                        1.0,  1.0,  1.0,
-                        1.0, -1.0,  1.0,
-                        -1.0, -1.0,  1.0,
-
-                        -1.0,  1.0, -1.0,
-                        1.0,  1.0, -1.0,
-                        1.0,  1.0,  1.0,
-                        1.0,  1.0,  1.0,
-                        -1.0,  1.0,  1.0,
-                        -1.0,  1.0, -1.0,
-
-                        -1.0, -1.0, -1.0,
-                        -1.0, -1.0,  1.0,
-                        1.0, -1.0, -1.0,
-                        1.0, -1.0, -1.0,
-                        -1.0, -1.0,  1.0,
-                        1.0, -1.0,  1.0
-                        ], dtype=np.float32)
-        
     def generate_shader(self):
         vertexShader = """
         #version 330
-        in vec3 positionIn;
+        in vec4 positionIn;
         
-        uniform mat4 viewToClipTransform;
-        uniform mat4 worldToViewTransform;
-        
-        out vec3 v2f_texCoord;
+        uniform mat4 modelToClipTransform;
+
+        out vec2 v2f_texCoord;
 
         void main()
         {
-            vec4 viewPos = worldToViewTransform * vec4(positionIn, 1.0);
-            gl_Position = viewToClipTransform * vec4(viewPos.xyz, 1.0);
-            v2f_texCoord = positionIn;
+            gl_Position = modelToClipTransform * vec4(positionIn.xy, 0.0, 1.0);
+            v2f_texCoord = positionIn.zw;
         }
         """
         fragmentShader = """
         #version 330
-        in vec3	v2f_texCoord;
-        
-        uniform samplerCube skybox;
+        in vec2 v2f_texCoord;
+    
+        uniform sampler2D texture1;
+        uniform vec3 textColor;
         
         out vec4 fragmentColor;
-        
+
         void main()
         {    
-            fragmentColor = texture(skybox, v2f_texCoord);
+            vec4 sampled = vec4(1.0, 1.0, 1.0, texture(texture1, v2f_texCoord).r);
+            fragmentColor = vec4(textColor, 1.0) * sampled;
         }
         """
         self.shader = buildShader([vertexShader], [fragmentShader], {"positionIn" : 0})
-        if self.shader == None:
-            raise Exception("Skybox shader not implemented")
-        

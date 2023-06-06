@@ -1,15 +1,13 @@
 from OpenGL.GL import *
-
 import math
 import numpy as np
 import time
 import imgui
-import magic
 import lab_utils as lu
-import glob
-import os
+import custom as cu
 import copy
-from PIL import Image
+from random import uniform
+import random
 
 # Light Source Paramaters
 g_lightYaw = .0
@@ -18,22 +16,29 @@ g_lightDistance = 0.0
 g_lightColour = lu.vec3(1.0, 1.0, 1.0)
 g_lightIntensity = 1.0
 g_ambientColour = lu.vec3(1.0, 1.0, 1.0)
-g_ambientIntensity = 0.05
+g_ambientIntensity = 0.003
 
 # Cameras
 g_cameraFree = False
-g_freeCamera = lu.FreeCamera([32.0, 18.0, -4.5], 76.0, 28.0)
-g_orbitCamera = lu.OrbitCamera([0,0,0], 50, -40.0, -40)
+g_freeCamera = cu.FreeCamera([32.0, 18.0, -4.5], 76.0, 28.0)
+g_orbitCamera = cu.OrbitCamera([0,0,0], 50, -40.0, -40)
 g_selected = 8
 g_last_lock = 8
 g_justSwapped = False
 
 # Scaling Controls
 g_baseScale = 10.0
-g_scalePlanets = 7.0
-g_scaleDistance = 5.0
-g_timeScale = 1.0
+g_scalePlanets = 10.0
+g_scaleDistance = 2.5
+g_prev_ScaleDistance = 5.0
+g_timeScale = 0.0
 g_previous_time = time.time()
+
+# Asteriod Belt Position
+g_asteriod_start = 329
+g_asteriod_end = 478
+g_asteriod_radius = 75
+g_asteriod_middle = 403
 
 # Time Controls
 g_timeInSeconds = True  
@@ -55,15 +60,15 @@ def setCameraLock():
         selected_planet = g_planets_data[g_selected]
         g_orbitCamera.target = selected_planet["current_position"]
         if g_last_lock != g_selected:
-            g_orbitCamera.distance = selected_planet["current_radius"] * 6
-            g_orbitCamera.yawDeg = -40.0
-            g_orbitCamera.pitchDeg = -40.0     
+            g_orbitCamera.distance = selected_planet["current_radius"] * 6 
     else:
         g_orbitCamera.target = lu.vec3(0,0,0)
         if g_last_lock != g_selected:
             g_orbitCamera.distance = 50
-            g_orbitCamera.yawDeg = -40.0
-            g_orbitCamera.pitchDeg = -40.0     
+
+    if g_last_lock != g_selected:
+        g_orbitCamera.yawDeg = -35.0
+        g_orbitCamera.pitchDeg = -35.0     
             
     cameraPosition = lu.vec3(0.0, 0.0, g_orbitCamera.distance)
     cameraRotation = lu.Mat3(lu.make_rotation_y(math.radians(g_orbitCamera.yawDeg))) * lu.Mat3(lu.make_rotation_x(math.radians(g_orbitCamera.pitchDeg)))
@@ -71,12 +76,12 @@ def setCameraLock():
     g_orbitCamera.position = rotatedPosition + g_orbitCamera.target
     g_last_lock = g_selected
 
-
 # This function is called by the 'magic' to draw a frame width, height are the size of the frame buffer, or window
 def renderFrame(width, height):
     global g_previous_time
     global g_planets_data
     global g_justSwapped
+    global g_prev_ScaleDistance
     
     if g_timeInSeconds:
         timeFactor = 1.0
@@ -85,7 +90,7 @@ def renderFrame(width, height):
     
     glViewport(0, 0, width, height)
     # Set the colour we want the frame buffer cleared to, 
-    glClearColor(0.2, 0.3, 0.1, 1.0)
+    glClearColor(1.0, 1.0, 1.0, 1.0)
     # Tell OpenGL to clear the render target to the clear values for both depth and colour buffers (depth uses the default)
     glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT)
 
@@ -108,9 +113,10 @@ def renderFrame(width, height):
         setCameraLock()
         worldToView = g_orbitCamera.getWorldToViewMatrix([0,1,0])
     
-    # Transforms 
+    # Calculate viewToClip transform
     viewToClip = lu.make_perspective(70.0, width / height, 0.1, 12000.0)
-    modelToView = lu.make_translation(0.0, 1.0, 0.0)
+    # Calculate base transforms as backup
+    modelToView = lu.make_translation(0.0, 0.0, 0.0)
     modelToViewNormal = lu.inverse(lu.transpose(lu.Mat3(modelToView)));
 
     # Render Skybox
@@ -122,15 +128,19 @@ def renderFrame(width, height):
 
     # Light Parameters
     lightRotation = lu.Mat3(lu.make_rotation_y(math.radians(g_lightYaw))) * lu.Mat3(lu.make_rotation_x(math.radians(g_lightPitch))) 
-    lightPosition = lightRotation * lu.vec3(0,0,g_lightDistance)
-    lightParameters = [lightPosition, g_lightColour, g_lightIntensity, g_ambientColour, g_ambientIntensity]
+    lightPosition =  lightRotation * lu.vec3(0,0,g_lightDistance)
+    lightPosition_inViewSpace = lu.transformPoint(worldToView, lightPosition)  # Transform light position into view space
+    lightParameters = [lightPosition_inViewSpace, g_lightColour, g_lightIntensity, g_ambientColour, g_ambientIntensity]
+
 
     # Pole correction transform (textures are flipped on the poles)
     correctPoles = lu.make_rotation_x(math.radians(-270))
 
+
     # Draw the sun
     sunLightParameters = [lightPosition, g_lightColour, 0.0, g_ambientColour, 1.0]
-    sunModelToWorld = lu.make_translation(lightPosition[0], lightPosition[1], lightPosition[2]) * lu.make_uniform_scale(g_baseScale) * correctPoles
+    spin = lu.make_rotation_y(6 * time.time() * (g_timeScale / timeFactor / 27))
+    sunModelToWorld = lu.make_translation(lightPosition[0], lightPosition[1], lightPosition[2]) * spin * lu.make_uniform_scale(g_baseScale) * correctPoles
     g_sunModel.draw(viewToClip * worldToView * sunModelToWorld, modelToView, modelToViewNormal, sunLightParameters)
     
     for planet in g_planets_data:
@@ -145,34 +155,81 @@ def renderFrame(width, height):
         
         # Calculate ModelToWorld transformation
         modelToWorld = orbit * distance * spin * lu.make_uniform_scale(g_baseScale * planet["radius"] * g_scalePlanets) * correctPoles
-        
-        # Calculate light parameters
-        lightParameters[0] = lu.transformPoint(lu.inverse(modelToWorld), lightPosition)
-        
+
+        # Calculate ModelToView transformation
+        modelToView = worldToView * modelToWorld
+
+        # Calculate ModelToViewNormal transformation
+        modelToViewNormal = lu.inverse(lu.transpose(lu.Mat3(modelToView)));
+
         # Update its position and radius for camera locking
         planet["current_position"] = lu.transformPoint(modelToWorld, [0,0,0])
         planet["current_radius"] = planet["radius"] * g_baseScale * g_scalePlanets
         
         # Draw model and orbit ring
-        planet["model"].draw(viewToClip * worldToView * modelToWorld, modelToView, modelToViewNormal, lightParameters)
+        planet["model"].draw(viewToClip * modelToView, modelToView, modelToViewNormal, lightParameters)
         planet["ring"].draw(viewToClip * worldToView * lu.make_scale(planet["dist"] / g_scaleDistance, 1.0, planet["dist"] / g_scaleDistance))
+    
+    for i, asteriod in enumerate(g_asteriod_data):
+        # Update orbit position
+        asteriod["orbit_pos"] += dt * g_timeScale / timeFactor / asteriod["orbit"] * 360
+        asteriod["orbit_pos"] %= 360.0
+  
+        # Calculate transformations
+        orbit = lu.make_rotation_y(math.radians(asteriod["orbit_pos"]))
+        spin = lu.make_rotation_y(6 * time.time() * (g_timeScale / timeFactor / asteriod["rotation"]))
+        distance  = lu.make_translation(0.0, 0.0, asteriod["dist"] / g_scaleDistance)
+        height = lu.make_translation(0.0, asteriod["height"] / g_scaleDistance, 0.0)
+        
+        # Calculate ModelToWorld transformation
+        modelToWorld = orbit * height * distance * spin * lu.make_uniform_scale(g_baseScale * asteriod["radius"] * g_scalePlanets) 
+
+        asteriod['model'].draw(viewToClip * worldToView * modelToWorld, [[0.56, 0.56, 0.56],  0.15])
+    
+    if g_scaleDistance != g_prev_ScaleDistance:
+        g_dustTorus.update(g_asteriod_middle / g_scaleDistance, g_asteriod_radius / g_scaleDistance)
+    
+    spin = lu.make_rotation_y(6 * time.time() * (g_timeScale / timeFactor / 730))
+    g_dustTorus.draw(viewToClip * worldToView * spin, [[0.33, 0.33, 0.33], 0.072])
+    g_prev_ScaleDistance = g_scaleDistance
     
 def initResources():
     global g_sunModel
     global g_skybox
     global g_planets_data
+    global g_asteriod_data
+    global g_dustTorus
+    global g_textRender
     
+    num_asteriods = 200
         
-    g_skybox = lu.SkyBox()
-    g_sunModel = lu.Sphere("data/planets/sun.jpg")  
+    g_skybox = cu.SkyBox()
+    g_sunModel = cu.Sphere("data/planets/sun.jpg")  
+    g_dustTorus = cu.Dust(radius=g_asteriod_middle / g_scaleDistance, tube_radius=g_asteriod_radius / g_scaleDistance)
+    # g_textRender = lu.Text("data/fonts/Aaargh.ttf")
     
     g_planets_data = generate_planets_data()
-       
+    g_asteriod_data = generate_asteriod_data(num_asteriods)
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_CULL_FACE)
     glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS)
     glEnable(GL_FRAMEBUFFER_SRGB)
+
+
+def generate_asteriod_data(num_rocks):
+    g_asteriod_data = []
+    for i in range(num_rocks):
+        g_asteriod_data.append({
+            "model" : cu.SpaceRock(),
+            "orbit_pos": i * (360 / num_rocks), 
+            "dist": random.randint(329, 478),
+            "height" : random.randint(-g_asteriod_radius, g_asteriod_radius),
+            "radius": random.uniform(0.0004, 0.0008), 
+            "rotation": random.randint(1, 150), 
+            "orbit":  random.randint(100, 300)
+        })
+    return g_asteriod_data
 
 def drawUi():
     global g_cameraFree
@@ -205,12 +262,12 @@ def drawUi():
             imgui.columns(1)
         imgui.tree_pop()
     
-    if imgui.tree_node("Planet Controls (1.0 = Real)", imgui.TREE_NODE_DEFAULT_OPEN):
+    if imgui.tree_node("Planet Controls (1.0 = Real)"):
         _,g_scalePlanets = imgui.slider_int("Planet Size", g_scalePlanets, 1.0, 50.0)
-        _,g_scaleDistance = imgui.slider_float("Planet Distance", g_scaleDistance, 1.0, 5.0)
+        _,g_scaleDistance = imgui.slider_float("Planet Distance", g_scaleDistance, 1.0, 6.0)
         imgui.tree_pop()
     
-    if imgui.tree_node("Time Controls ", imgui.TREE_NODE_DEFAULT_OPEN):
+    if imgui.tree_node("Time Controls "):
         if imgui.radio_button("Seconds", g_timeInSeconds == True):
             g_timeInSeconds = True
         if imgui.radio_button("Minutes", g_timeInSeconds == False):
@@ -221,31 +278,33 @@ def drawUi():
             _,g_timeScale = imgui.slider_int("1 minute = x Days", g_timeScale, 0, 365)
         imgui.tree_pop()
         
-    ## EXTRA -------------------------------
-    global g_lightYaw
-    global g_lightPitch
-    global g_lightDistance
-    global g_lightColour
-    global g_lightIntensity
-    global g_ambientColour
-    global g_ambientIntensity
+    # ## EXTRA -------------------------------
+    # global g_lightYaw
+    # global g_lightPitch
+    # global g_lightDistance
+    # global g_lightColour
+    # global g_lightIntensity
+    # global g_ambientColour
+    # global g_ambientIntensity
 
-    if imgui.tree_node("Light"):
-        _,g_lightYaw = imgui.slider_float("Yaw (Deg)", g_lightYaw, -360.00, 360.0)
-        _,g_lightPitch = imgui.slider_float("Pitch (Deg)", g_lightPitch, -360.00, 360.0)
-        _,g_lightDistance = imgui.slider_float("Distance", g_lightDistance, -50, 50.0)
-        _,g_lightColour = lu.imguiX_color_edit3_list("Sun Light Color",  g_lightColour)
-        _,g_lightIntensity = imgui.slider_float("Sun Light Intensity", g_lightIntensity, 0.0, 1.0)
-        _,g_ambientColour = lu.imguiX_color_edit3_list("Ambient Color",  g_ambientColour)
-        _,g_ambientIntensity = imgui.slider_float("Ambient Intensity", g_ambientIntensity, 0.0, 1.0)
-        imgui.tree_pop()
+    # if imgui.tree_node("Light"):
+    #     _,g_lightYaw = imgui.slider_float("Yaw (Deg)", g_lightYaw, -360.00, 360.0)
+    #     _,g_lightPitch = imgui.slider_float("Pitch (Deg)", g_lightPitch, -360.00, 360.0)
+    #     _,g_lightDistance = imgui.slider_float("Distance", g_lightDistance, -50, 50.0)
+    #     _,g_lightColour = lu.imguiX_color_edit3_list("Sun Light Color",  g_lightColour)
+    #     _,g_lightIntensity = imgui.slider_float("Sun Light Intensity", g_lightIntensity, 0.0, 1.0)
+    #     _,g_ambientColour = lu.imguiX_color_edit3_list("Ambient Color",  g_ambientColour)
+    #     _,g_ambientIntensity = imgui.slider_float("Ambient Intensity", g_ambientIntensity, 0.0, 1.0)
+    #     imgui.tree_pop()
+
+
 
 
 def generate_planets_data():
     planets_data = [
         {
-            "model": lu.Sphere("data/planets/mercury.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/mercury.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 58, 
             "radius": 0.0033, 
@@ -253,8 +312,8 @@ def generate_planets_data():
             "orbit": 88
         },
         {
-            "model": lu.Sphere("data/planets/venus.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/venus.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 108, 
             "radius": 0.0102, 
@@ -262,8 +321,8 @@ def generate_planets_data():
             "orbit": 225
         },
         {
-            "model": lu.Sphere("data/planets/earth.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/earth.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 150, 
             "radius": 0.0106, 
@@ -271,8 +330,8 @@ def generate_planets_data():
             "orbit": 365
         },
         {
-            "model": lu.Sphere("data/planets/mars.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/mars.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 228, 
             "radius": 0.0056, 
@@ -280,8 +339,8 @@ def generate_planets_data():
             "orbit": 687
         },
         {
-            "model": lu.Sphere("data/planets/jupiter.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/jupiter.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 778, 
             "radius": 0.1183, 
@@ -289,8 +348,8 @@ def generate_planets_data():
             "orbit": 4333
         },
         {
-            "model": lu.Sphere("data/planets/saturn.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/saturn.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 1429, 
             "radius": 0.1003, 
@@ -298,8 +357,8 @@ def generate_planets_data():
             "orbit": 10759
         },
         {
-            "model": lu.Sphere("data/planets/uranus.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/uranus.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 2871, 
             "radius": 0.0428, 
@@ -307,8 +366,8 @@ def generate_planets_data():
             "orbit": 30687
         },
         {
-            "model": lu.Sphere("data/planets/neptune.jpg"), 
-            "ring": lu.OrbitRing(), 
+            "model": cu.Sphere("data/planets/neptune.jpg"), 
+            "ring": cu.OrbitRing(), 
             "orbit_pos": 0, 
             "dist": 4504, 
             "radius": 0.0411, 
@@ -321,50 +380,6 @@ def generate_planets_data():
 
 # This does all the openGL setup and window creation needed
 # it hides a lot of things that we will want to get a handle on as time goes by.
-magic.runProgram("COSC3000 - Computer Graphics Lab 1, part 2", 1280, 800, renderFrame, initResources, drawUi, update)
+lu.runProgram("Solar System", 1280, 800, renderFrame, initResources, drawUi, update)
 
 
-
-# OOOLLLD STUFF...
-
-    # glUseProgram(g_shader)
-
-    # lu.setUniform(g_shader, "viewSpaceLightPosition", lu.transformPoint(worldToView, lightPosition))
-    # lu.setUniform(g_shader, "lightColourAndIntensity", g_lightColourAndIntensity)
-    # lu.setUniform(g_shader, "ambientLightColourAndIntensity", g_ambientLightColourAndIntensity)
-
-    # transforms = {
-    #     "modelToClipTransform" : viewToClip * worldToView,
-    #     "modelToView" : modelToView,
-    #     "modelToViewNormal" : modelToViewNormal,
-    # }
-    # lu.drawSphere(lightPosition, 2.0, [1,1,0,1], viewToClip, worldToView)
-    # # transforms["modelToClipTransform"] = viewToClip * worldToView
-    # g_planetModel.render(g_shader, ObjModel.RF_Opaque, transforms, "sun.jpg")
-
-    # numBalls = 75
-    # phi = math.pi * (math.sqrt(5.) - 1.)
-    
-    # for i in range(numBalls):
-    #     y = 1 - (i / float(numBalls - 1)) * 2  # y goes from 1 to -1
-    #     radius = math.sqrt(1 - y * y)  # radius at y
-
-    #     theta = phi * i  # golden angle increment
-
-    #     x = math.cos(theta) * radius
-    #     z = math.sin(theta) * radius
-        
-    #     x, y, z = x * 10, y * 10,  z * 10 # Increase the radious
-        
-    #     # New code
-    #     modelToWorldTransform = lu.make_rotation_y(math.radians(time.time() * 2)) * lu.make_translation(x, y, z)
-    #     transforms["modelToClipTransform"] = viewToClip * worldToView * modelToWorldTransform
-
-    #     g_planetModel.render(g_shader, ObjModel.RF_Opaque, transforms)
-    #     # glEnable(GL_BLEND)
-    #     # glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    #     # g_sunModel.render(g_shader, ObjModel.RF_Transparent| ObjModel.RF_AlphaTested, transforms)
-    #     # glDisable(GL_BLEND)
-    
-    # marsModelToWorldTransform = lu.make_rotation_y(math.radians(time.time() * 2)) * lu.make_translation(0, 0, 0)
-    # g_planetModel
